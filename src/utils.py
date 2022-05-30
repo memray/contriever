@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 def init_logger(args):
     if torch.distributed.is_initialized(): 
         torch.distributed.barrier()
-    file_handler = logging.FileHandler(filename=os.path.join(args.output_dir, 'run.log'))
+    file_handler = logging.FileHandler(filename=os.path.join(args.output_dir, f'{args.dataset}.log'))
     stdout_handler = logging.StreamHandler(sys.stdout)
     handlers = [file_handler, stdout_handler]
     logging.basicConfig(

@@ -3,6 +3,8 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+import os
+import inspect
 
 import torch
 import torch.distributed as dist
@@ -63,7 +65,12 @@ class DenseEncoderModel:
                 ids, mask = qencode['input_ids'], qencode['attention_mask']
                 ids, mask = ids.cuda(), mask.cuda()
 
-                emb = self.query_encoder(ids, mask, normalize=self.norm_query)
+                if 'normalize' in inspect.getfullargspec(self.query_encoder.forward).args:
+                    emb = self.query_encoder(ids, mask, normalize=self.norm_query)
+                else:
+                    emb = self.query_encoder(ids, mask)
+                if hasattr(emb, 'pooler_output'):
+                    emb = emb['pooler_output']
                 allemb.append(emb)
 
         allemb = torch.cat(allemb, dim=0) 
@@ -102,7 +109,12 @@ class DenseEncoderModel:
                 ids, mask = cencode['input_ids'], cencode['attention_mask']
                 ids, mask = ids.cuda(), mask.cuda()
 
-                emb = self.doc_encoder(ids, mask, normalize=self.norm_doc)
+                if 'normalize' in inspect.getfullargspec(self.query_encoder.forward).args:
+                    emb = self.query_encoder(ids, mask, normalize=self.norm_query)
+                else:
+                    emb = self.query_encoder(ids, mask)
+                if hasattr(emb, 'pooler_output'):
+                    emb = emb['pooler_output']
                 allemb.append(emb)
 
         allemb = torch.cat(allemb, dim=0)
@@ -146,7 +158,7 @@ def evaluate_model(
             norm_query=norm_query, 
             norm_doc=norm_doc
         ), 
-        batch_size=128
+        batch_size=batch_size
     )
     retriever = EvaluateRetrieval(dmodel, score_function=metric) 
     url = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{}.zip".format(dataset)
@@ -170,8 +182,11 @@ def evaluate_model(
         for sub in cqasubsets:
             data_folder = os.path.join(data_path, sub)
             corpus, queries, qrels = GenericDataLoader(data_folder=data_folder).load(split=split)
+            if is_main: print(f'Start retrieving, #(corpus)={len(corpus)}, #(queries)={len(queries)}, '
+                              f'batch_size={retriever.retriever.batch_size}, chunk_size={retriever.retriever.corpus_chunk_size}')
             results = retriever.retrieve(corpus, queries)
             if is_main:
+                print(f'Start evaluating, #(qrels)={len(qrels)}, #(results)={len(results)}')
                 ndcg, _map, recall, precision = retriever.evaluate(qrels, results, retriever.k_values)
                 mrr = retriever.evaluate_custom(qrels, results, retriever.k_values, metric="mrr")
                 recall_cap = retriever.evaluate_custom(qrels, results, retriever.k_values, metric="recall_cap")
@@ -190,14 +205,17 @@ def evaluate_model(
             precision = {key: sum(item.get(key) for item in precisions) / 12 for key in precisions[0]}
             mrr = {key: sum(item.get(key) for item in mrrs) / 12 for key in mrrs[0]}
             recall_cap = {key: sum(item.get(key) for item in recall_caps) / 12 for key in recall_caps[0]}
-            holes = {key: sum(item.get(key) for item in holes) / 12 for key in holes[0]}
+            hole = {key: sum(item.get(key) for item in holes) / 12 for key in holes[0]}
         else:
             ndcg, _map, recall, precision = None, None, None, None
             mrr, recall_cap, hole = None, None, None
     else:
         corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split=split)
+        if is_main: print(f'Start retrieving, #(corpus)={len(corpus)}, #(queries)={len(queries)},'
+                          f'batch_size={retriever.retriever.batch_size}, chunk_size={retriever.retriever.corpus_chunk_size}')
         results = retriever.retrieve(corpus, queries)
         if is_main:
+            print(f'Start evaluating, #(qrels)={len(qrels)}, #(results)={len(results)}')
             ndcg, _map, recall, precision = retriever.evaluate(qrels, results, retriever.k_values)
             mrr = retriever.evaluate_custom(qrels, results, retriever.k_values, metric="mrr")
             recall_cap = retriever.evaluate_custom(qrels, results, retriever.k_values, metric="recall_cap")

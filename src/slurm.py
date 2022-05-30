@@ -76,12 +76,15 @@ def init_distributed_mode(params):
     # multi-GPU job (local or multi-node) - jobs started with torch.distributed.launch
     elif params.local_rank != -1:
 
-        assert params.main_port == -1
+        # assert params.main_port == -1
 
         # read environment variables
         params.global_rank = int(os.environ['RANK'])
         params.world_size = int(os.environ['WORLD_SIZE'])
 
+        # @memray, always failed to pass ENV arguments (always 127.0.0.1:29500), so set them here
+        os.environ['MASTER_ADDR'] = params.main_addr
+        os.environ['MASTER_PORT'] = str(params.main_port)
         is_distributed = True
 
     # local job (single GPU)
@@ -105,8 +108,14 @@ def init_distributed_mode(params):
         # MASTER_ADDR - required (except for rank 0); address of rank 0 node
         # WORLD_SIZE - required; can be set either here, or in a call to init function
         # RANK - required; can be set either here, or in a call to init function
+        world_size = os.environ.get("WORLD_SIZE", None)
+        master_addr = os.environ.get("MASTER_ADDR", None)
+        master_port = os.environ.get("MASTER_PORT", None)
+        print(world_size)
+        print(master_addr)
+        print(master_port)
 
-        #print("Initializing PyTorch distributed ...")
+        print("Initializing PyTorch distributed ...")
         torch.distributed.init_process_group(
             init_method='env://',
             backend='nccl',
