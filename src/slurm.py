@@ -49,9 +49,10 @@ def init_distributed_mode(params):
         - world_size
     """
     is_slurm_job = 'SLURM_JOB_ID' in os.environ and not 'WORLD_SIZE' in os.environ
+    has_local_rank = hasattr(params, 'local_rank')
 
     # SLURM job without torch.distributed.launch
-    if is_slurm_job:
+    if is_slurm_job and has_local_rank:
 
         assert params.local_rank == -1   # on the cluster, this is handled by SLURM
 
@@ -74,9 +75,9 @@ def init_distributed_mode(params):
 
 
     # multi-GPU job (local or multi-node) - jobs started with torch.distributed.launch
-    elif params.local_rank != -1:
+    elif has_local_rank and params.local_rank != -1:
 
-        # assert params.main_port == -1
+        assert params.main_port == -1
 
         # read environment variables
         params.global_rank = int(os.environ['RANK'])
@@ -89,8 +90,6 @@ def init_distributed_mode(params):
 
     # local job (single GPU)
     else:
-        assert params.local_rank == -1
-        assert params.main_port == -1
         params.local_rank = 0
         params.global_rank = 0
         params.world_size = 1
@@ -108,6 +107,14 @@ def init_distributed_mode(params):
         # MASTER_ADDR - required (except for rank 0); address of rank 0 node
         # WORLD_SIZE - required; can be set either here, or in a call to init function
         # RANK - required; can be set either here, or in a call to init function
+
+        #print("Initializing PyTorch distributed ...")
+        torch.distributed.init_process_group(
+            init_method='env://',
+            backend='nccl',
+            #world_size=params.world_size,
+            #rank=params.global_rank,
+        )
         world_size = os.environ.get("WORLD_SIZE", None)
         master_addr = os.environ.get("MASTER_ADDR", None)
         master_port = os.environ.get("MASTER_PORT", None)
@@ -119,6 +126,6 @@ def init_distributed_mode(params):
         torch.distributed.init_process_group(
             init_method='env://',
             backend='nccl',
-            world_size=params.world_size,
-            rank=params.global_rank,
+            # world_size=params.world_size,
+            # rank=params.global_rank,
         )

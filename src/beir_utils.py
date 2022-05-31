@@ -1,23 +1,23 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-import os
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import glob
 import inspect
-
-import torch
-import torch.distributed as dist
+import os
+from collections import defaultdict
 from typing import List, Dict
 import numpy as np
-
-import src.dist_utils as dist_utils
+import torch
+import torch.distributed as dist
 
 import beir.util
 from beir.datasets.data_loader import GenericDataLoader
 from beir.retrieval.evaluation import EvaluateRetrieval
 from beir.retrieval.search.dense import DenseRetrievalExactSearch
 
+from beir.reranking.models import CrossEncoder
+from beir.reranking import Rerank
+
+import src.dist_utils as dist_utils
+from src import normalize_text
 
 class DenseEncoderModel:
     def __init__(
@@ -29,6 +29,8 @@ class DenseEncoderModel:
         add_special_tokens=True, 
         norm_query=False, 
         norm_doc=False,
+        lower_case=False,
+        normalize_text=False,
         **kwargs
     ):
         self.query_encoder = query_encoder
@@ -38,6 +40,8 @@ class DenseEncoderModel:
         self.add_special_tokens = add_special_tokens
         self.norm_query = norm_query
         self.norm_doc = norm_doc
+        self.lower_case = lower_case
+        self.normalize_text = normalize_text
   
     def encode_queries(self, queries: List[str], batch_size: int, **kwargs) -> np.ndarray:
 
@@ -45,7 +49,12 @@ class DenseEncoderModel:
             idx = np.array_split(range(len(queries)), dist.get_world_size())[dist.get_rank()]
         else:
             idx = range(len(queries))
+
         queries = [queries[i] for i in idx]
+        if self.normalize_text:
+            queries = [normalize_text.normalize(q) for q in queries]
+        if self.lower_case:
+            queries = [q.lower() for q in queries]
 
         allemb = []
         nbatch = (len(queries)-1) // batch_size + 1
@@ -62,18 +71,22 @@ class DenseEncoderModel:
                     add_special_tokens=self.add_special_tokens,
                     return_tensors="pt", 
                 )
-                ids, mask = qencode['input_ids'], qencode['attention_mask']
-                ids, mask = ids.cuda(), mask.cuda()
-
+                qencode = {key:value.cuda() for key, value in qencode.items()}
                 if 'normalize' in inspect.getfullargspec(self.query_encoder.forward).args:
-                    emb = self.query_encoder(ids, mask, normalize=self.norm_query)
+                    # Contriever
+                    emb = self.query_encoder(**qencode, normalize=self.norm_query)
+                    # emb = self.query_encoder(ids, mask, normalize=self.norm_query)
                 else:
+                    # other HFTransformer models
+                    ids, mask = qencode['input_ids'], qencode['attention_mask']
+                    ids, mask = ids.cuda(), mask.cuda()
                     emb = self.query_encoder(ids, mask)
-                if hasattr(emb, 'pooler_output'):
+                if hasattr(emb, 'pooler_output'):  # HFTransformer models
                     emb = emb['pooler_output']
-                allemb.append(emb)
+                allemb.append(emb.cpu())
 
-        allemb = torch.cat(allemb, dim=0) 
+        allemb = torch.cat(allemb, dim=0)
+        allemb = allemb.cuda()
         if dist.is_initialized():
             allemb = dist_utils.varsize_gather_nograd(allemb)
         allemb = allemb.cpu().numpy()
@@ -90,6 +103,10 @@ class DenseEncoderModel:
         corpus = [
             c['title'] + ' ' + c['text'] if len(c['title']) > 0 else c['text'] for c in corpus
         ]
+        if self.normalize_text:
+            corpus = [normalize_text.normalize(c) for c in corpus]
+        if self.lower_case:
+            corpus = [c.lower() for c in corpus]
         
         allemb = []
         nbatch = (len(corpus)-1) // batch_size + 1
@@ -106,18 +123,23 @@ class DenseEncoderModel:
                     add_special_tokens=self.add_special_tokens,
                     return_tensors="pt", 
                 )
-                ids, mask = cencode['input_ids'], cencode['attention_mask']
-                ids, mask = ids.cuda(), mask.cuda()
+                cencode = {key:value.cuda() for key, value in cencode.items()}
 
                 if 'normalize' in inspect.getfullargspec(self.query_encoder.forward).args:
-                    emb = self.query_encoder(ids, mask, normalize=self.norm_query)
+                    # Contriever
+                    emb = self.doc_encoder(**cencode, normalize=self.norm_doc)
+                    # emb = self.doc_encoder(ids, mask, normalize=self.norm_query)
                 else:
-                    emb = self.query_encoder(ids, mask)
-                if hasattr(emb, 'pooler_output'):
+                    # other HFTransformer models
+                    ids, mask = cencode['input_ids'], cencode['attention_mask']
+                    ids, mask = ids.cuda(), mask.cuda()
+                    emb = self.doc_encoder(ids, mask)
+                if hasattr(emb, 'pooler_output'):  # HFTransformer models
                     emb = emb['pooler_output']
-                allemb.append(emb)
+                allemb.append(emb.cpu())
 
         allemb = torch.cat(allemb, dim=0)
+        allemb = allemb.cuda()
         if dist.is_initialized():
             allemb = dist_utils.varsize_gather_nograd(allemb)
         allemb = allemb.cpu().numpy()
@@ -133,10 +155,15 @@ def evaluate_model(
         norm_query=False, 
         norm_doc=False, 
         is_main=True, 
-        split='test', 
-        metric='dot',
-        beir_data_path="BEIR/datasets",
+        split="test",
+        score_function="dot",
+        beir_dir="BEIR/datasets",
+        save_results_path=None,
+        lower_case=False,
+        normalize_text=False,
     ):
+
+    metrics = defaultdict(list) #store final results
 
     if hasattr(query_encoder, "module"):
         query_encoder = query_encoder.module
@@ -156,71 +183,47 @@ def evaluate_model(
             tokenizer=tokenizer, 
             add_special_tokens=add_special_tokens, 
             norm_query=norm_query, 
-            norm_doc=norm_doc
-        ), 
-        batch_size=batch_size
+            norm_doc=norm_doc,
+            lower_case=lower_case,
+            normalize_text=normalize_text,
+        ),
+        batch_size=batch_size,
     )
-    retriever = EvaluateRetrieval(dmodel, score_function=metric) 
-    url = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{}.zip".format(dataset)
-    data_path = beir.util.download_and_unzip(url, beir_data_path)
-    if dataset == 'cqadupstack':
-        ndcgs, _maps, recalls, precisions, mrrs, recall_caps, holes = [], [], [], [], [], [], []
-        cqasubsets = [
-            'android', 
-            'english', 
-            'gaming', 
-            'gis', 
-            'mathematica', 
-            'physics', 
-            'programmers', 
-            'stats', 
-            'tex', 
-            'unix', 
-            'webmasters', 
-            'wordpress'
-        ]
-        for sub in cqasubsets:
-            data_folder = os.path.join(data_path, sub)
-            corpus, queries, qrels = GenericDataLoader(data_folder=data_folder).load(split=split)
-            if is_main: print(f'Start retrieving, #(corpus)={len(corpus)}, #(queries)={len(queries)}, '
-                              f'batch_size={retriever.retriever.batch_size}, chunk_size={retriever.retriever.corpus_chunk_size}')
-            results = retriever.retrieve(corpus, queries)
-            if is_main:
-                print(f'Start evaluating, #(qrels)={len(qrels)}, #(results)={len(results)}')
-                ndcg, _map, recall, precision = retriever.evaluate(qrels, results, retriever.k_values)
-                mrr = retriever.evaluate_custom(qrels, results, retriever.k_values, metric="mrr")
-                recall_cap = retriever.evaluate_custom(qrels, results, retriever.k_values, metric="recall_cap")
-                hole = retriever.evaluate_custom(qrels, results, retriever.k_values, metric="hole")
-                ndcgs.append(ndcg)
-                _maps.append(_map)
-                recalls.append(recall)
-                precisions.append(precision)
-                mrrs.append(mrr)
-                recall_caps.append(recall_cap)
-                holes.append(hole)
-        if is_main:
-            ndcg = {key: sum(item.get(key) for item in ndcgs) / 12 for key in ndcgs[0]}
-            _map = {key: sum(item.get(key) for item in _maps) / 12 for key in _maps[0]}
-            recall = {key: sum(item.get(key) for item in recalls) / 12 for key in recalls[0]}
-            precision = {key: sum(item.get(key) for item in precisions) / 12 for key in precisions[0]}
-            mrr = {key: sum(item.get(key) for item in mrrs) / 12 for key in mrrs[0]}
-            recall_cap = {key: sum(item.get(key) for item in recall_caps) / 12 for key in recall_caps[0]}
-            hole = {key: sum(item.get(key) for item in holes) / 12 for key in holes[0]}
-        else:
-            ndcg, _map, recall, precision = None, None, None, None
-            mrr, recall_cap, hole = None, None, None
-    else:
+    retriever = EvaluateRetrieval(dmodel, score_function=score_function)
+    data_path = os.path.join(beir_dir, dataset)
+
+    if not os.path.isdir(data_path) and is_main:
+        url = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{}.zip".format(dataset)
+        data_path = beir.util.download_and_unzip(url, beir_dir)
+    dist_utils.barrier()
+
+    if not dataset == 'cqadupstack':
         corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split=split)
-        if is_main: print(f'Start retrieving, #(corpus)={len(corpus)}, #(queries)={len(queries)},'
-                          f'batch_size={retriever.retriever.batch_size}, chunk_size={retriever.retriever.corpus_chunk_size}')
         results = retriever.retrieve(corpus, queries)
         if is_main:
-            print(f'Start evaluating, #(qrels)={len(qrels)}, #(results)={len(results)}')
             ndcg, _map, recall, precision = retriever.evaluate(qrels, results, retriever.k_values)
-            mrr = retriever.evaluate_custom(qrels, results, retriever.k_values, metric="mrr")
-            recall_cap = retriever.evaluate_custom(qrels, results, retriever.k_values, metric="recall_cap")
-            hole = retriever.evaluate_custom(qrels, results, retriever.k_values, metric="hole")
-        else:
-            ndcg, _map, recall, precision = None, None, None, None
-            mrr, recall_cap, hole = None, None, None
-    return ndcg, _map, recall, precision, mrr, recall_cap, hole
+            for metric in (ndcg, _map, recall, precision, 'mrr', 'recall_cap', 'hole'):
+                if isinstance(metric, str):
+                    metric = retriever.evaluate_custom(qrels, results, retriever.k_values, metric=metric)
+                for key, value in metric.items():
+                    metrics[key].append(value)
+            if save_results_path is not None:
+                torch.save(results, f"{save_results_path}")
+    elif dataset == 'cqadupstack': #compute macroaverage over datasets
+        paths = glob.glob(data_path)
+        for path in paths:
+            corpus, queries, qrels = GenericDataLoader(data_folder=path).load(split=split)
+            results = retriever.retrieve(corpus, queries)
+            if is_main:
+                ndcg, _map, recall, precision = retriever.evaluate(qrels, results, retriever.k_values)
+                for metric in (ndcg, _map, recall, precision, 'mrr', 'recall_cap', 'hole'):
+                    if isinstance(metric, str):
+                        metric = retriever.evaluate_custom(qrels, results, retriever.k_values, metric=metric)
+                    for key, value in metric.items():
+                        metrics[key].append(value)
+        for key, value in metrics.items():
+            assert len(value) == 12, f"cqadupstack includes 12 datasets, only {len(value)} values were compute for the {key} metric"
+
+    metrics = {key: 100*np.mean(value) for key, value in metrics.items()}
+
+    return metrics
