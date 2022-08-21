@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="GCP ir-cuda114" remoteFilesAllowedToDisappearOnAutoupload="false" autoUploadExternalChanges="true" showAutoUploadSettingsWarning="false">
+    <serverData>
+      <paths name="GCP ir">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/project/search/contriever" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="GCP kp">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/project/search/contriever" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>
