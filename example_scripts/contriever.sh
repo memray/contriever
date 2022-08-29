@@ -37,7 +37,7 @@ srun ~gizacard/anaconda3/envs/contriever/bin/python3 train.py \
         --augmentation $AUG --prob_augmentation $PAUG \
         --train_data $TRAINDATASETS --loading_mode split \
         --ratio_min $rmin --ratio_max $rmax --chunk_length 256 \
-        --momentum $MOM --moco_queue $QSIZE --temperature $T \
+        --momentum $MOM --queue_size $QSIZE --temperature $T \
         --warmup_steps 20000 --total_steps 500000 --lr 0.00005 \
         --name $name \
         --scheduler linear \
